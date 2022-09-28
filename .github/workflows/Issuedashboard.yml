@@ -1,0 +1,82 @@
+name: Build Dashboard
+
+on:
+  push:
+    branches:
+      - dashboard
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v2
+    - name: Check out Dashboard branch
+      uses: actions/checkout@v2
+      with:
+        ref: 'dashboard'
+        path: 'out'
+
+    - name: 'Generate Dashboard'
+      uses: ethomson/issue-dashboard@v1
+      with:
+        config: |
+          title: 'Dashboard'
+          output:
+            format: markdown
+            filename: 'out/dashboard.md'
+          sections:
+          - title: 'Pull Requests'
+            widgets:
+            - type: 'table'
+              title: 'New Pull Requests (This Week)'
+              issue_query: 'repo:dapr/components-contrib is:open is:issue created:>{{ date("-7 days") }} sort:created-asc'
+          - title: 'Issues by labels'
+            widgets:
+            - type: 'number'
+              title:  Bug
+              issue_query: 'repo:dapr/components-contrib is:open is:issue label:kind/bug'
+              color: red
+            - type: 'number'
+              title: 'P1'
+              issue_query: 'repo:dapr/components-contrib is:open is:issue label:P1'
+              color: green
+            - type: 'number'
+              title: 'Good First Issue'
+              issue_query: 'repo:dapr/components-contrib is:open is:issue label:"good first issue" '
+              color: blue
+            - type: 'number'
+              title: 'Help wanted'
+              issue_query: 'repo:dapr/components-contrib is:open is:issue label:"help wanted" '
+          - title: 'Issues by Age'
+            widgets: 
+            - type: 'graph'
+              title: 'Age'
+              elements:
+              - title: '7 days'
+                color: 'green'
+                issue_query: 'repo:dapr/components-contrib is:issue is:open created:>{{ date("-7 day") }}'
+              - title: '1 month'
+                color: 'blue'
+                issue_query: 'repo:dapr/components-contrib is:issue is:open created:>{{ date("-1 month") }}'
+              - title: '3 months'
+                color: 'black'
+                issue_query: 'repo:dapr/components-contrib is:issue is:open created:>{{ date("-3 month") }}'
+              - title: '1 year'
+                color: 'green'
+                issue_query: 'repo:dapr/components-contrib is:issue is:open created:>{{ date("-1 year") }}'
+              - title: '>1 year'
+                color: 'red'
+                issue_query: 'repo:dapr/components-contrib is:issue is:open created:<{{ date("-1 year") }}'
+          
+        token: ${{ github.token }}
+
+    - name: Publish Documentation
+      run: |
+        git add .
+        git config user.name 'Dashboard User'
+        git config user.email 'nobody@nowhere'
+        git commit -m 'Dashboard update' --allow-empty
+        git push origin dashboard
+      working-directory: out
