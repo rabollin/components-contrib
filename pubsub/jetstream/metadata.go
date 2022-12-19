@@ -16,7 +16,10 @@ package jetstream
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/nats-io/nats.go"
 
 	"github.com/dapr/components-contrib/pubsub"
 )
@@ -26,17 +29,28 @@ type metadata struct {
 
 	jwt     string
 	seedKey string
+	token   string
 
 	tlsClientCert string
 	tlsClientKey  string
 
 	name           string
+	streamName     string
 	durableName    string
 	queueGroupName string
 	startSequence  uint64
 	startTime      time.Time
-	deliverAll     bool
 	flowControl    bool
+	ackWait        time.Duration
+	maxDeliver     int
+	backOff        []time.Duration
+	maxAckPending  int
+	replicas       int
+	memoryStorage  bool
+	rateLimit      uint64
+	hearbeat       time.Duration
+	deliverPolicy  nats.DeliverPolicy
+	ackPolicy      nats.AckPolicy
 }
 
 func parseMetadata(psm pubsub.Metadata) (metadata, error) {
@@ -48,6 +62,7 @@ func parseMetadata(psm pubsub.Metadata) (metadata, error) {
 		return metadata{}, fmt.Errorf("missing nats URL")
 	}
 
+	m.token = psm.Properties["token"]
 	m.jwt = psm.Properties["jwt"]
 	m.seedKey = psm.Properties["seedKey"]
 
@@ -75,7 +90,11 @@ func parseMetadata(psm pubsub.Metadata) (metadata, error) {
 	}
 
 	m.durableName = psm.Properties["durableName"]
-	m.queueGroupName = psm.Properties["queueGroupName"]
+	if val, ok := psm.Properties["queueGroupName"]; ok && val != "" {
+		m.queueGroupName = val
+	} else {
+		m.queueGroupName = psm.Properties[pubsub.RuntimeConsumerIDKey]
+	}
 
 	if v, err := strconv.ParseUint(psm.Properties["startSequence"], 10, 64); err == nil {
 		m.startSequence = v
@@ -85,12 +104,72 @@ func parseMetadata(psm pubsub.Metadata) (metadata, error) {
 		m.startTime = time.Unix(v, 0)
 	}
 
-	if v, err := strconv.ParseBool(psm.Properties["deliverAll"]); err == nil {
-		m.deliverAll = v
-	}
-
 	if v, err := strconv.ParseBool(psm.Properties["flowControl"]); err == nil {
 		m.flowControl = v
+	}
+	if v, err := time.ParseDuration(psm.Properties["ackWait"]); err == nil {
+		m.ackWait = v
+	}
+
+	if v, err := strconv.Atoi(psm.Properties["maxDeliver"]); err == nil {
+		m.maxDeliver = v
+	}
+
+	backOffSlice := strings.Split(psm.Properties["backOff"], ",")
+	var backOff []time.Duration
+
+	for _, item := range backOffSlice {
+		trimmed := strings.TrimSpace(item)
+		if duration, err := time.ParseDuration(trimmed); err == nil {
+			backOff = append(backOff, duration)
+		}
+	}
+	m.backOff = backOff
+
+	if v, err := strconv.Atoi(psm.Properties["maxAckPending"]); err == nil {
+		m.maxAckPending = v
+	}
+	if v, err := strconv.Atoi(psm.Properties["replicas"]); err == nil {
+		m.replicas = v
+	}
+	if v, err := strconv.ParseBool(psm.Properties["memoryStorage"]); err == nil {
+		m.memoryStorage = v
+	}
+	if v, err := strconv.ParseUint(psm.Properties["rateLimit"], 10, 64); err == nil {
+		m.rateLimit = v
+	}
+
+	if v, err := time.ParseDuration(psm.Properties["hearbeat"]); err == nil {
+		m.hearbeat = v
+	}
+
+	deliverPolicy := psm.Properties["deliverPolicy"]
+	switch deliverPolicy {
+	case "all", "":
+		m.deliverPolicy = nats.DeliverAllPolicy
+	case "last":
+		m.deliverPolicy = nats.DeliverLastPolicy
+	case "new":
+		m.deliverPolicy = nats.DeliverNewPolicy
+	case "sequence":
+		m.deliverPolicy = nats.DeliverByStartSequencePolicy
+	case "time":
+		m.deliverPolicy = nats.DeliverByStartTimePolicy
+	default:
+		return metadata{}, fmt.Errorf("deliver policy %s is not one of: all, last, new, sequence, time", deliverPolicy)
+	}
+
+	m.streamName = psm.Properties["streamName"]
+
+	switch psm.Properties["ackPolicy"] {
+	case "explicit":
+		m.ackPolicy = nats.AckExplicitPolicy
+	case "all":
+		m.ackPolicy = nats.AckAllPolicy
+	case "none":
+		m.ackPolicy = nats.AckNonePolicy
+	default:
+		m.ackPolicy = nats.AckExplicitPolicy
 	}
 
 	return m, nil

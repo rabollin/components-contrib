@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,7 +90,11 @@ func (m *mqttPubSub) Init(metadata pubsub.Metadata) error {
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
 	// mqtt broker allows only one connection at a given time from a clientID.
-	producerClientID := fmt.Sprintf("%s-producer", m.metadata.clientID)
+	producerClientID := m.metadata.producerID
+	if producerClientID == "" {
+		// for backwards-compatibility; see: https://github.com/dapr/components-contrib/pull/2104
+		producerClientID = m.metadata.consumerID + "-producer"
+	}
 	connCtx, connCancel := context.WithTimeout(m.ctx, defaultWait)
 	p, err := m.connect(connCtx, producerClientID)
 	connCancel()
@@ -203,7 +208,11 @@ func (m *mqttPubSub) resetSubscription() {
 // startSubscription connects to the server and begins receiving messages
 func (m *mqttPubSub) startSubscription(ctx context.Context) error {
 	// mqtt broker allows only one connection at a given time from a clientID.
-	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
+	consumerClientID := m.metadata.consumerID
+	if m.metadata.producerID == "" {
+		// for backwards-compatibility; see: https://github.com/dapr/components-contrib/pull/2104
+		consumerClientID += "-consumer"
+	}
 	connCtx, connCancel := context.WithTimeout(ctx, defaultWait)
 	c, err := m.connect(connCtx, consumerClientID)
 	connCancel()
@@ -239,16 +248,8 @@ func (m *mqttPubSub) startSubscription(ctx context.Context) error {
 // onMessage returns the callback to be invoked when there's a new message from a topic
 func (m *mqttPubSub) onMessage(ctx context.Context) func(client mqtt.Client, mqttMsg mqtt.Message) {
 	return func(client mqtt.Client, mqttMsg mqtt.Message) {
-		// Turn off auto-ACK
-		mqttMsg.AutoAckOff()
-
 		ack := false
 		defer func() {
-			// Do not send N/ACKs on retained messages
-			if mqttMsg.Retained() {
-				return
-			}
-
 			// MQTT does not support NACK's, so in case of error we need to re-enqueue the message and then send a positive ACK for this message
 			// Note that if the connection drops before the message is explicitly ACK'd below, then it's automatically re-sent (assuming QoS is 1 or greater, which is the default). So we do not risk losing messages.
 			// Problem with this approach is that if the service crashes between the time the message is re-enqueued and when the ACK is sent, the message may be delivered twice
@@ -276,8 +277,9 @@ func (m *mqttPubSub) onMessage(ctx context.Context) func(client mqtt.Client, mqt
 		}()
 
 		msg := pubsub.NewMessage{
-			Topic: mqttMsg.Topic(),
-			Data:  mqttMsg.Payload(),
+			Topic:    mqttMsg.Topic(),
+			Data:     mqttMsg.Payload(),
+			Metadata: map[string]string{"retained": strconv.FormatBool(mqttMsg.Retained())},
 		}
 
 		topicHandler := m.handlerForTopic(msg.Topic)
@@ -328,6 +330,8 @@ func (m *mqttPubSub) connect(ctx context.Context, clientID string) (mqtt.Client,
 		return nil, err
 	}
 	opts := m.createClientOptions(uri, clientID)
+	// Turn off auto-ack
+	opts.SetAutoAckDisabled(true)
 	client := mqtt.NewClient(opts)
 
 	// Add all routes before we connect to catch messages that may be delivered before client.Subscribe is invoked

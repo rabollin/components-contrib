@@ -14,10 +14,11 @@ limitations under the License.
 package dynamodb
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	jsoniterator "github.com/json-iterator/go"
 
 	awsAuth "github.com/dapr/components-contrib/internal/authentication/aws"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
 )
@@ -79,7 +81,7 @@ func (d *StateStore) Features() []state.Feature {
 }
 
 // Get retrieves a dynamoDB item.
-func (d *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (d *StateStore) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	input := &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(req.Options.Consistency == state.Strong),
 		TableName:      aws.String(d.table),
@@ -90,7 +92,7 @@ func (d *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
 		},
 	}
 
-	result, err := d.client.GetItem(input)
+	result, err := d.client.GetItemWithContext(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -133,13 +135,13 @@ func (d *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
 }
 
 // BulkGet performs a bulk get operations.
-func (d *StateStore) BulkGet(req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
+func (d *StateStore) BulkGet(ctx context.Context, req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
 	// TODO: replace with dynamodb.BatchGetItem for performance
 	return false, nil, nil
 }
 
 // Set saves a dynamoDB item.
-func (d *StateStore) Set(req *state.SetRequest) error {
+func (d *StateStore) Set(ctx context.Context, req *state.SetRequest) error {
 	item, err := d.getItemFromReq(req)
 	if err != nil {
 		return err
@@ -165,7 +167,7 @@ func (d *StateStore) Set(req *state.SetRequest) error {
 		input.ConditionExpression = &condExpr
 	}
 
-	_, err = d.client.PutItem(input)
+	_, err = d.client.PutItemWithContext(ctx, input)
 	if err != nil && haveEtag {
 		switch cErr := err.(type) {
 		case *dynamodb.ConditionalCheckFailedException:
@@ -177,11 +179,11 @@ func (d *StateStore) Set(req *state.SetRequest) error {
 }
 
 // BulkSet performs a bulk set operation.
-func (d *StateStore) BulkSet(req []state.SetRequest) error {
+func (d *StateStore) BulkSet(ctx context.Context, req []state.SetRequest) error {
 	writeRequests := []*dynamodb.WriteRequest{}
 
 	if len(req) == 1 {
-		return d.Set(&req[0])
+		return d.Set(ctx, &req[0])
 	}
 
 	for _, r := range req {
@@ -210,7 +212,7 @@ func (d *StateStore) BulkSet(req []state.SetRequest) error {
 	requestItems := map[string][]*dynamodb.WriteRequest{}
 	requestItems[d.table] = writeRequests
 
-	_, e := d.client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+	_, e := d.client.BatchWriteItemWithContext(ctx, &dynamodb.BatchWriteItemInput{
 		RequestItems: requestItems,
 	})
 
@@ -218,7 +220,7 @@ func (d *StateStore) BulkSet(req []state.SetRequest) error {
 }
 
 // Delete performs a delete operation.
-func (d *StateStore) Delete(req *state.DeleteRequest) error {
+func (d *StateStore) Delete(ctx context.Context, req *state.DeleteRequest) error {
 	input := &dynamodb.DeleteItemInput{
 		Key: map[string]*dynamodb.AttributeValue{
 			"key": {
@@ -238,7 +240,7 @@ func (d *StateStore) Delete(req *state.DeleteRequest) error {
 		input.ExpressionAttributeValues = exprAttrValues
 	}
 
-	_, err := d.client.DeleteItem(input)
+	_, err := d.client.DeleteItemWithContext(ctx, input)
 	if err != nil {
 		switch cErr := err.(type) {
 		case *dynamodb.ConditionalCheckFailedException:
@@ -250,11 +252,11 @@ func (d *StateStore) Delete(req *state.DeleteRequest) error {
 }
 
 // BulkDelete performs a bulk delete operation.
-func (d *StateStore) BulkDelete(req []state.DeleteRequest) error {
+func (d *StateStore) BulkDelete(ctx context.Context, req []state.DeleteRequest) error {
 	writeRequests := []*dynamodb.WriteRequest{}
 
 	if len(req) == 1 {
-		return d.Delete(&req[0])
+		return d.Delete(ctx, &req[0])
 	}
 
 	for _, r := range req {
@@ -277,29 +279,27 @@ func (d *StateStore) BulkDelete(req []state.DeleteRequest) error {
 	requestItems := map[string][]*dynamodb.WriteRequest{}
 	requestItems[d.table] = writeRequests
 
-	_, e := d.client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+	_, e := d.client.BatchWriteItemWithContext(ctx, &dynamodb.BatchWriteItemInput{
 		RequestItems: requestItems,
 	})
 
 	return e
 }
 
-func (d *StateStore) getDynamoDBMetadata(metadata state.Metadata) (*dynamoDBMetadata, error) {
-	b, err := json.Marshal(metadata.Properties)
-	if err != nil {
-		return nil, err
-	}
+func (d *StateStore) GetComponentMetadata() map[string]string {
+	metadataStruct := dynamoDBMetadata{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
+}
 
-	var meta dynamoDBMetadata
-	err = json.Unmarshal(b, &meta)
-	if err != nil {
-		return nil, err
-	}
-	if meta.Table == "" {
+func (d *StateStore) getDynamoDBMetadata(meta state.Metadata) (*dynamoDBMetadata, error) {
+	var m dynamoDBMetadata
+	err := metadata.DecodeMetadata(meta.Properties, &m)
+	if m.Table == "" {
 		return nil, fmt.Errorf("missing dynamodb table name")
 	}
-
-	return &meta, nil
+	return &m, err
 }
 
 func (d *StateStore) getClient(metadata *dynamoDBMetadata) (*dynamodb.DynamoDB, error) {

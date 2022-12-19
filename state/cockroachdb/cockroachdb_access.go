@@ -14,37 +14,47 @@ limitations under the License.
 package cockroachdb
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
-
-	"github.com/agrea/ptr"
+	"time"
 
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/components-contrib/state/query"
 	"github.com/dapr/components-contrib/state/utils"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
+	"github.com/dapr/kit/retry"
 
 	// Blank import for the underlying PostgreSQL driver.
-	_ "github.com/jackc/pgx/v4/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
-	connectionStringKey        = "connectionString"
-	errMissingConnectionString = "missing connection string"
-	tableName                  = "state"
+	connectionStringKey          = "connectionString"
+	errMissingConnectionString   = "missing connection string"
+	tableName                    = "state"
+	defaultMaxConnectionAttempts = 5 // A bad driver connection error can occur inside the sql code so this essentially allows for more retries since the sql code does not allow that to be changed
 )
 
 // cockroachDBAccess implements dbaccess.
 type cockroachDBAccess struct {
 	logger           logger.Logger
-	metadata         state.Metadata
+	metadata         cockroachDBMetadata
 	db               *sql.DB
 	connectionString string
+}
+
+type cockroachDBMetadata struct {
+	ConnectionString      string
+	TableName             string
+	MaxConnectionAttempts *int
 }
 
 // newCockroachDBAccess creates a new instance of cockroachDBAccess.
@@ -52,27 +62,40 @@ func newCockroachDBAccess(logger logger.Logger) *cockroachDBAccess {
 	logger.Debug("Instantiating new CockroachDB state store")
 
 	return &cockroachDBAccess{
-		logger: logger,
-		metadata: state.Metadata{
-			Base: metadata.Base{Properties: map[string]string{}},
-		},
+		logger:           logger,
+		metadata:         cockroachDBMetadata{},
 		db:               nil,
 		connectionString: "",
 	}
+}
+
+func parseMetadata(meta state.Metadata) (*cockroachDBMetadata, error) {
+	m := cockroachDBMetadata{}
+	metadata.DecodeMetadata(meta.Properties, &m)
+
+	if m.ConnectionString == "" {
+		return nil, errors.New(errMissingConnectionString)
+	}
+
+	return &m, nil
 }
 
 // Init sets up CockroachDB connection and ensures that the state table exists.
 func (p *cockroachDBAccess) Init(metadata state.Metadata) error {
 	p.logger.Debug("Initializing CockroachDB state store")
 
-	p.metadata = metadata
+	meta, err := parseMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	p.metadata = *meta
 
-	if val, ok := metadata.Properties[connectionStringKey]; ok && val != "" {
-		p.connectionString = val
-	} else {
+	if p.metadata.ConnectionString == "" {
 		p.logger.Error("Missing CockroachDB connection string")
 
 		return fmt.Errorf(errMissingConnectionString)
+	} else {
+		p.connectionString = p.metadata.ConnectionString
 	}
 
 	databaseConn, err := sql.Open("pgx", p.connectionString)
@@ -92,16 +115,17 @@ func (p *cockroachDBAccess) Init(metadata state.Metadata) error {
 		return err
 	}
 
+	// Ensure that a connection to the database is actually established
+	err = p.Ping()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // Set makes an insert or update to the database.
-func (p *cockroachDBAccess) Set(req *state.SetRequest) error {
-	return state.SetWithOptions(p.setValue, req)
-}
-
-// setValue is an internal implementation of set to enable passing the logic to state.SetWithRetries as a func.
-func (p *cockroachDBAccess) setValue(req *state.SetRequest) error {
+func (p *cockroachDBAccess) Set(ctx context.Context, req *state.SetRequest) error {
 	p.logger.Debug("Setting state value in CockroachDB")
 
 	value, isBinary, err := validateAndReturnValue(req)
@@ -114,7 +138,7 @@ func (p *cockroachDBAccess) setValue(req *state.SetRequest) error {
 	// Sprintf is required for table name because sql.DB does not substitute parameters for table names.
 	// Other parameters use sql.DB parameter substitution.
 	if req.ETag == nil {
-		result, err = p.db.Exec(fmt.Sprintf(
+		result, err = p.db.ExecContext(ctx, fmt.Sprintf(
 			`INSERT INTO %s (key, value, isbinary, etag) VALUES ($1, $2, $3, 1)
 			ON CONFLICT (key) DO UPDATE SET value = $2, isbinary = $3, updatedate = NOW(), etag = EXCLUDED.etag + 1;`,
 			tableName), req.Key, value, isBinary)
@@ -127,7 +151,7 @@ func (p *cockroachDBAccess) setValue(req *state.SetRequest) error {
 		etag := uint32(etag64)
 
 		// When an etag is provided do an update - no insert.
-		result, err = p.db.Exec(fmt.Sprintf(
+		result, err = p.db.ExecContext(ctx, fmt.Sprintf(
 			`UPDATE %s SET value = $1, isbinary = $2, updatedate = NOW(), etag = etag + 1
 			 WHERE key = $3 AND etag = $4;`,
 			tableName), value, isBinary, req.Key, etag)
@@ -149,7 +173,7 @@ func (p *cockroachDBAccess) setValue(req *state.SetRequest) error {
 	return nil
 }
 
-func (p *cockroachDBAccess) BulkSet(req []state.SetRequest) error {
+func (p *cockroachDBAccess) BulkSet(ctx context.Context, req []state.SetRequest) error {
 	p.logger.Debug("Executing BulkSet request")
 	tx, err := p.db.Begin()
 	if err != nil {
@@ -159,7 +183,7 @@ func (p *cockroachDBAccess) BulkSet(req []state.SetRequest) error {
 	if len(req) > 0 {
 		for _, s := range req {
 			sa := s // Fix for gosec  G601: Implicit memory aliasing in for loop.
-			err = p.Set(&sa)
+			err = p.Set(ctx, &sa)
 			if err != nil {
 				tx.Rollback()
 
@@ -174,8 +198,9 @@ func (p *cockroachDBAccess) BulkSet(req []state.SetRequest) error {
 }
 
 // Get returns data from the database. If data does not exist for the key an empty state.GetResponse will be returned.
-func (p *cockroachDBAccess) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (p *cockroachDBAccess) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	p.logger.Debug("Getting state value from CockroachDB")
+
 	if req.Key == "" {
 		return nil, fmt.Errorf("missing key in get operation")
 	}
@@ -183,7 +208,7 @@ func (p *cockroachDBAccess) Get(req *state.GetRequest) (*state.GetResponse, erro
 	var value string
 	var isBinary bool
 	var etag int
-	err := p.db.QueryRow(fmt.Sprintf("SELECT value, isbinary, etag FROM %s WHERE key = $1", tableName), req.Key).Scan(&value, &isBinary, &etag)
+	err := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT value, isbinary, etag FROM %s WHERE key = $1", tableName), req.Key).Scan(&value, &isBinary, &etag)
 	if err != nil {
 		// If no rows exist, return an empty response, otherwise return the error.
 		if errors.Is(err, sql.ErrNoRows) {
@@ -207,7 +232,7 @@ func (p *cockroachDBAccess) Get(req *state.GetRequest) (*state.GetResponse, erro
 
 		return &state.GetResponse{
 			Data:        data,
-			ETag:        ptr.String(strconv.Itoa(etag)),
+			ETag:        ptr.Of(strconv.Itoa(etag)),
 			Metadata:    req.Metadata,
 			ContentType: nil,
 		}, nil
@@ -215,20 +240,16 @@ func (p *cockroachDBAccess) Get(req *state.GetRequest) (*state.GetResponse, erro
 
 	return &state.GetResponse{
 		Data:        []byte(value),
-		ETag:        ptr.String(strconv.Itoa(etag)),
+		ETag:        ptr.Of(strconv.Itoa(etag)),
 		Metadata:    req.Metadata,
 		ContentType: nil,
 	}, nil
 }
 
 // Delete removes an item from the state store.
-func (p *cockroachDBAccess) Delete(req *state.DeleteRequest) error {
-	return state.DeleteWithOptions(p.deleteValue, req)
-}
-
-// deleteValue is an internal implementation of delete to enable passing the logic to state.DeleteWithRetries as a func.
-func (p *cockroachDBAccess) deleteValue(req *state.DeleteRequest) error {
+func (p *cockroachDBAccess) Delete(ctx context.Context, req *state.DeleteRequest) error {
 	p.logger.Debug("Deleting state value from CockroachDB")
+
 	if req.Key == "" {
 		return fmt.Errorf("missing key in delete operation")
 	}
@@ -237,7 +258,7 @@ func (p *cockroachDBAccess) deleteValue(req *state.DeleteRequest) error {
 	var err error
 
 	if req.ETag == nil {
-		result, err = p.db.Exec("DELETE FROM state WHERE key = $1", req.Key)
+		result, err = p.db.ExecContext(ctx, "DELETE FROM state WHERE key = $1", req.Key)
 	} else {
 		var etag64 uint64
 		etag64, err = strconv.ParseUint(*req.ETag, 10, 32)
@@ -246,7 +267,7 @@ func (p *cockroachDBAccess) deleteValue(req *state.DeleteRequest) error {
 		}
 		etag := uint32(etag64)
 
-		result, err = p.db.Exec("DELETE FROM state WHERE key = $1 and etag = $2", req.Key, etag)
+		result, err = p.db.ExecContext(ctx, "DELETE FROM state WHERE key = $1 and etag = $2", req.Key, etag)
 	}
 
 	if err != nil {
@@ -265,7 +286,7 @@ func (p *cockroachDBAccess) deleteValue(req *state.DeleteRequest) error {
 	return nil
 }
 
-func (p *cockroachDBAccess) BulkDelete(req []state.DeleteRequest) error {
+func (p *cockroachDBAccess) BulkDelete(ctx context.Context, req []state.DeleteRequest) error {
 	p.logger.Debug("Executing BulkDelete request")
 	tx, err := p.db.Begin()
 	if err != nil {
@@ -275,7 +296,7 @@ func (p *cockroachDBAccess) BulkDelete(req []state.DeleteRequest) error {
 	if len(req) > 0 {
 		for _, d := range req {
 			da := d // Fix for gosec  G601: Implicit memory aliasing in for loop.
-			err = p.Delete(&da)
+			err = p.Delete(ctx, &da)
 			if err != nil {
 				tx.Rollback()
 
@@ -289,7 +310,7 @@ func (p *cockroachDBAccess) BulkDelete(req []state.DeleteRequest) error {
 	return err
 }
 
-func (p *cockroachDBAccess) ExecuteMulti(request *state.TransactionalStateRequest) error {
+func (p *cockroachDBAccess) ExecuteMulti(ctx context.Context, request *state.TransactionalStateRequest) error {
 	p.logger.Debug("Executing PostgreSQL transaction")
 
 	tx, err := p.db.Begin()
@@ -308,7 +329,7 @@ func (p *cockroachDBAccess) ExecuteMulti(request *state.TransactionalStateReques
 				return err
 			}
 
-			err = p.Set(&setReq)
+			err = p.Set(ctx, &setReq)
 			if err != nil {
 				tx.Rollback()
 				return err
@@ -323,7 +344,7 @@ func (p *cockroachDBAccess) ExecuteMulti(request *state.TransactionalStateReques
 				return err
 			}
 
-			err = p.Delete(&delReq)
+			err = p.Delete(ctx, &delReq)
 			if err != nil {
 				tx.Rollback()
 				return err
@@ -341,14 +362,14 @@ func (p *cockroachDBAccess) ExecuteMulti(request *state.TransactionalStateReques
 }
 
 // Query executes a query against store.
-func (p *cockroachDBAccess) Query(req *state.QueryRequest) (*state.QueryResponse, error) {
+func (p *cockroachDBAccess) Query(ctx context.Context, req *state.QueryRequest) (*state.QueryResponse, error) {
 	p.logger.Debug("Getting query value from CockroachDB")
 
 	stateQuery := &Query{
 		query:  "",
 		params: []interface{}{},
 		limit:  0,
-		skip:   ptr.Int64(0),
+		skip:   ptr.Of[int64](0),
 	}
 	qbuilder := query.NewQueryBuilder(stateQuery)
 	if err := qbuilder.BuildQuery(&req.Query); err != nil {
@@ -361,7 +382,7 @@ func (p *cockroachDBAccess) Query(req *state.QueryRequest) (*state.QueryResponse
 
 	p.logger.Debug("Query: " + stateQuery.query)
 
-	data, token, err := stateQuery.execute(p.logger, p.db)
+	data, token, err := stateQuery.execute(ctx, p.logger, p.db)
 	if err != nil {
 		return &state.QueryResponse{
 			Results:  []state.QueryItem{},
@@ -379,7 +400,27 @@ func (p *cockroachDBAccess) Query(req *state.QueryRequest) (*state.QueryResponse
 
 // Ping implements database ping.
 func (p *cockroachDBAccess) Ping() error {
-	return p.db.Ping()
+	retryCount := defaultMaxConnectionAttempts
+	if p.metadata.MaxConnectionAttempts != nil && *p.metadata.MaxConnectionAttempts >= 0 {
+		retryCount = *p.metadata.MaxConnectionAttempts
+	}
+	config := retry.DefaultConfig()
+	config.Policy = retry.PolicyExponential
+	config.MaxInterval = 100 * time.Millisecond
+	config.MaxRetries = int64(retryCount)
+	backoff := config.NewBackOff()
+
+	return retry.NotifyRecover(func() error {
+		err := p.db.Ping()
+		if errors.Is(err, driver.ErrBadConn) {
+			return fmt.Errorf("error when attempting to establish connection with cockroachDB: %v", err)
+		}
+		return nil
+	}, backoff, func(err error, _ time.Duration) {
+		p.logger.Debugf("Could not establish connection with cockroachDB. Retrying...: %v", err)
+	}, func() {
+		p.logger.Debug("Successfully established connection with cockroachDB after it previously failed")
+	})
 }
 
 // Close implements io.Close.

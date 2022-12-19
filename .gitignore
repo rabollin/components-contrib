@@ -6,3 +6,5 @@ vendor
 go.work
 go.work.sum
 .DS_Store
+component-metadata-bundle.json
+*.log

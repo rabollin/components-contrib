@@ -14,16 +14,16 @@ limitations under the License.
 package cockroachdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/agrea/ptr"
-
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/components-contrib/state/query"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 type Query struct {
@@ -133,8 +133,8 @@ func (q *Query) Finalize(filters string, storeQuery *query.Query) error {
 	return nil
 }
 
-func (q *Query) execute(logger logger.Logger, db *sql.DB) ([]state.QueryItem, string, error) {
-	rows, err := db.Query(q.query, q.params...)
+func (q *Query) execute(ctx context.Context, logger logger.Logger, db *sql.DB) ([]state.QueryItem, string, error) {
+	rows, err := db.QueryContext(ctx, q.query, q.params...)
 	if err != nil {
 		return nil, "", fmt.Errorf("query executes '%s' failed: %w", q.query, err)
 	}
@@ -153,7 +153,7 @@ func (q *Query) execute(logger logger.Logger, db *sql.DB) ([]state.QueryItem, st
 		result := state.QueryItem{
 			Key:         key,
 			Data:        data,
-			ETag:        ptr.String(strconv.Itoa(etag)),
+			ETag:        ptr.Of(strconv.Itoa(etag)),
 			Error:       "",
 			ContentType: nil,
 		}

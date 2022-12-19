@@ -14,14 +14,16 @@ limitations under the License.
 package parameterstore
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"reflect"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 
 	awsAuth "github.com/dapr/components-contrib/internal/authentication/aws"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/kit/logger"
 )
@@ -31,12 +33,14 @@ const (
 	VersionID = "version_id"
 )
 
+var _ secretstores.SecretStore = (*ssmSecretStore)(nil)
+
 // NewParameterStore returns a new ssm parameter store.
 func NewParameterStore(logger logger.Logger) secretstores.SecretStore {
 	return &ssmSecretStore{logger: logger}
 }
 
-type parameterStoreMetaData struct {
+type ParameterStoreMetaData struct {
 	Region       string `json:"region"`
 	AccessKey    string `json:"accessKey"`
 	SecretKey    string `json:"secretKey"`
@@ -68,7 +72,7 @@ func (s *ssmSecretStore) Init(metadata secretstores.Metadata) error {
 }
 
 // GetSecret retrieves a secret using a key and returns a map of decrypted string/string values.
-func (s *ssmSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (s *ssmSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	name := req.Name
 
 	var versionID string
@@ -77,7 +81,7 @@ func (s *ssmSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretsto
 		name = fmt.Sprintf("%s:%s", req.Name, versionID)
 	}
 
-	output, err := s.client.GetParameter(&ssm.GetParameterInput{
+	output, err := s.client.GetParameterWithContext(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(s.prefix + name),
 		WithDecryption: aws.Bool(true),
 	})
@@ -97,7 +101,7 @@ func (s *ssmSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretsto
 }
 
 // BulkGetSecret retrieves all secrets in the store and returns a map of decrypted string/string values.
-func (s *ssmSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+func (s *ssmSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
 	resp := secretstores.BulkGetSecretResponse{
 		Data: map[string]map[string]string{},
 	}
@@ -117,7 +121,7 @@ func (s *ssmSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (s
 	}
 
 	for search {
-		output, err := s.client.DescribeParameters(&ssm.DescribeParametersInput{
+		output, err := s.client.DescribeParametersWithContext(ctx, &ssm.DescribeParametersInput{
 			MaxResults:       nil,
 			NextToken:        nextToken,
 			ParameterFilters: filters,
@@ -127,7 +131,7 @@ func (s *ssmSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (s
 		}
 
 		for _, entry := range output.Parameters {
-			params, err := s.client.GetParameter(&ssm.GetParameterInput{
+			params, err := s.client.GetParameterWithContext(ctx, &ssm.GetParameterInput{
 				Name:           entry.Name,
 				WithDecryption: aws.Bool(true),
 			})
@@ -148,7 +152,7 @@ func (s *ssmSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (s
 	return resp, nil
 }
 
-func (s *ssmSecretStore) getClient(metadata *parameterStoreMetaData) (*ssm.SSM, error) {
+func (s *ssmSecretStore) getClient(metadata *ParameterStoreMetaData) (*ssm.SSM, error) {
 	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, "")
 	if err != nil {
 		return nil, err
@@ -157,17 +161,20 @@ func (s *ssmSecretStore) getClient(metadata *parameterStoreMetaData) (*ssm.SSM, 
 	return ssm.New(sess), nil
 }
 
-func (s *ssmSecretStore) getSecretManagerMetadata(spec secretstores.Metadata) (*parameterStoreMetaData, error) {
-	b, err := json.Marshal(spec.Properties)
-	if err != nil {
-		return nil, err
-	}
+func (s *ssmSecretStore) getSecretManagerMetadata(spec secretstores.Metadata) (*ParameterStoreMetaData, error) {
+	meta := ParameterStoreMetaData{}
+	err := metadata.DecodeMetadata(spec.Properties, &meta)
+	return &meta, err
+}
 
-	var meta parameterStoreMetaData
-	err = json.Unmarshal(b, &meta)
-	if err != nil {
-		return nil, err
-	}
+// Features returns the features available in this secret store.
+func (s *ssmSecretStore) Features() []secretstores.Feature {
+	return []secretstores.Feature{} // No Feature supported.
+}
 
-	return &meta, nil
+func (s *ssmSecretStore) GetComponentMetadata() map[string]string {
+	metadataStruct := ParameterStoreMetaData{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

@@ -15,6 +15,7 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
@@ -88,17 +90,17 @@ func TestMySQLIntegration(t *testing.T) {
 			{
 				name: "Valid connection string",
 				props: map[string]string{
-					connectionStringKey: getConnectionString(""),
-					pemPathKey:          getPemPath(),
+					keyConnectionString: getConnectionString(""),
+					keyPemPath:          getPemPath(),
 				},
 				expectedErr: "",
 			},
 			{
 				name: "Valid table name",
 				props: map[string]string{
-					connectionStringKey: getConnectionString(""),
-					pemPathKey:          getPemPath(),
-					tableNameKey:        "stateStore",
+					keyConnectionString: getConnectionString(""),
+					keyPemPath:          getPemPath(),
+					keyTableName:        "stateStore",
 				},
 				expectedErr: "",
 			},
@@ -128,7 +130,7 @@ func TestMySQLIntegration(t *testing.T) {
 	pemPath := getPemPath()
 
 	metadata := state.Metadata{
-		Base: metadata.Base{Properties: map[string]string{connectionStringKey: connectionString, pemPathKey: pemPath}},
+		Base: metadata.Base{Properties: map[string]string{keyConnectionString: connectionString, keyPemPath: pemPath}},
 	}
 
 	mys := NewMySQLStateStore(logger.NewLogger("test")).(*MySQL)
@@ -147,7 +149,7 @@ func TestMySQLIntegration(t *testing.T) {
 		tableName := "test_state"
 
 		// Drop the table if it already exists
-		exists, err := tableExists(mys.db, tableName)
+		exists, err := tableExists(mys.db, tableName, 10*time.Second)
 		assert.Nil(t, err)
 		if exists {
 			dropTable(t, mys.db, tableName)
@@ -159,7 +161,7 @@ func TestMySQLIntegration(t *testing.T) {
 		assert.Nil(t, err)
 
 		// Now create it and make sure there are no errors
-		exists, err = tableExists(mys.db, tableName)
+		exists, err = tableExists(mys.db, tableName, 10*time.Second)
 		assert.Nil(t, err)
 		assert.True(t, exists)
 
@@ -205,7 +207,7 @@ func TestMySQLIntegration(t *testing.T) {
 			Key: "",
 		}
 
-		response, getErr := mys.Get(getReq)
+		response, getErr := mys.Get(context.Background(), getReq)
 		assert.NotNil(t, getErr)
 		assert.Nil(t, response)
 	})
@@ -242,7 +244,7 @@ func TestMySQLIntegration(t *testing.T) {
 			Key: "",
 		}
 
-		err := mys.Set(setReq)
+		err := mys.Set(context.Background(), setReq)
 		assert.NotNil(t, err, "Error was not nil when setting item with no key.")
 	})
 
@@ -302,7 +304,7 @@ func TestMySQLIntegration(t *testing.T) {
 			Value: newValue,
 		}
 
-		err := mys.Set(setReq)
+		err := mys.Set(context.Background(), setReq)
 		assert.NotNil(t, err, "Error was not thrown using old eTag")
 	})
 
@@ -318,7 +320,7 @@ func TestMySQLIntegration(t *testing.T) {
 			Value: value,
 		}
 
-		err := mys.Set(setReq)
+		err := mys.Set(context.Background(), setReq)
 		assert.NotNil(t, err)
 	})
 
@@ -338,7 +340,7 @@ func TestMySQLIntegration(t *testing.T) {
 			ETag: &eTag,
 		}
 
-		err := mys.Delete(deleteReq)
+		err := mys.Delete(context.Background(), deleteReq)
 		assert.NotNil(t, err)
 	})
 
@@ -349,7 +351,7 @@ func TestMySQLIntegration(t *testing.T) {
 			Key: "",
 		}
 
-		err := mys.Delete(deleteReq)
+		err := mys.Delete(context.Background(), deleteReq)
 		assert.NotNil(t, err)
 	})
 
@@ -361,7 +363,7 @@ func TestMySQLIntegration(t *testing.T) {
 			Key: randomKey(),
 		}
 
-		err := mys.Delete(deleteReq)
+		err := mys.Delete(context.Background(), deleteReq)
 		assert.Nil(t, err)
 	})
 
@@ -378,7 +380,7 @@ func TestMySQLIntegration(t *testing.T) {
 			},
 		}
 
-		err := mys.Set(setReq)
+		err := mys.Set(context.Background(), setReq)
 		assert.NoError(t, err)
 
 		// Get the etag
@@ -396,7 +398,7 @@ func TestMySQLIntegration(t *testing.T) {
 			},
 		}
 
-		err = mys.Set(setReq)
+		err = mys.Set(context.Background(), setReq)
 		assert.ErrorContains(t, err, "Duplicate entry")
 
 		// Insert with invalid etag should fail on existing keys
@@ -409,7 +411,7 @@ func TestMySQLIntegration(t *testing.T) {
 			},
 		}
 
-		err = mys.Set(setReq)
+		err = mys.Set(context.Background(), setReq)
 		assert.ErrorContains(t, err, "possible etag mismatch")
 
 		// Insert with valid etag should succeed on existing keys
@@ -422,7 +424,7 @@ func TestMySQLIntegration(t *testing.T) {
 			},
 		}
 
-		err = mys.Set(setReq)
+		err = mys.Set(context.Background(), setReq)
 		assert.NoError(t, err)
 
 		// Insert with an etag should fail on new keys
@@ -435,7 +437,7 @@ func TestMySQLIntegration(t *testing.T) {
 			},
 		}
 
-		err = mys.Set(setReq)
+		err = mys.Set(context.Background(), setReq)
 		assert.ErrorContains(t, err, "possible etag mismatch")
 	})
 
@@ -474,7 +476,7 @@ func TestMySQLIntegration(t *testing.T) {
 			})
 		}
 
-		err := mys.Multi(&state.TransactionalStateRequest{
+		err := mys.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: operations,
 		})
 		assert.Nil(t, err)
@@ -510,7 +512,7 @@ func TestMySQLIntegration(t *testing.T) {
 			})
 		}
 
-		err := mys.Multi(&state.TransactionalStateRequest{
+		err := mys.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: operations,
 		})
 		assert.Nil(t, err)
@@ -537,7 +539,7 @@ func TestMySQLIntegration(t *testing.T) {
 			})
 		}
 
-		err := mys.Multi(&state.TransactionalStateRequest{
+		err := mys.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: operations,
 		})
 		assert.Nil(t, err)
@@ -562,7 +564,7 @@ func testBulkSetAndBulkDelete(t *testing.T, mys *MySQL) {
 		},
 	}
 
-	err := mys.BulkSet(setReq)
+	err := mys.BulkSet(context.Background(), setReq)
 	assert.Nil(t, err)
 	assert.True(t, storeItemExists(t, setReq[0].Key))
 	assert.True(t, storeItemExists(t, setReq[1].Key))
@@ -576,7 +578,7 @@ func testBulkSetAndBulkDelete(t *testing.T, mys *MySQL) {
 		},
 	}
 
-	err = mys.BulkDelete(deleteReq)
+	err = mys.BulkDelete(context.Background(), deleteReq)
 	assert.Nil(t, err)
 	assert.False(t, storeItemExists(t, setReq[0].Key))
 	assert.False(t, storeItemExists(t, setReq[1].Key))
@@ -596,7 +598,7 @@ func setItem(t *testing.T, mys *MySQL, key string, value interface{}, eTag *stri
 		Value: value,
 	}
 
-	err := mys.Set(setReq)
+	err := mys.Set(context.Background(), setReq)
 	assert.Nil(t, err, "Error setting an item")
 	itemExists := storeItemExists(t, key)
 	assert.True(t, itemExists, "Item does not exist after being set")
@@ -608,7 +610,7 @@ func getItem(t *testing.T, mys *MySQL, key string) (*state.GetResponse, *fakeIte
 		Options: state.GetStateOption{},
 	}
 
-	response, getErr := mys.Get(getReq)
+	response, getErr := mys.Get(context.Background(), getReq)
 	assert.Nil(t, getErr)
 	assert.NotNil(t, response)
 	outputObject := &fakeItem{}
@@ -624,7 +626,7 @@ func deleteItem(t *testing.T, mys *MySQL, key string, eTag *string) {
 		Options: state.DeleteStateOption{},
 	}
 
-	deleteErr := mys.Delete(deleteReq)
+	deleteErr := mys.Delete(context.Background(), deleteReq)
 	assert.Nil(t, deleteErr, "There was an error deleting a record")
 	assert.False(t, storeItemExists(t, key), "Item still exists after delete")
 }

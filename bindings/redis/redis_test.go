@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dapr/components-contrib/bindings"
+	internalredis "github.com/dapr/components-contrib/internal/component/redis"
 	"github.com/dapr/kit/logger"
 )
 
@@ -30,7 +31,34 @@ const (
 	testKey  = "test"
 )
 
-func TestInvoke(t *testing.T) {
+func TestInvokeCreate(t *testing.T) {
+	s, c := setupMiniredis()
+	defer s.Close()
+
+	// miniRedis is compatible with the existing v8 client
+	bind := &Redis{
+		client: c,
+		logger: logger.NewLogger("test"),
+	}
+	bind.ctx, bind.cancel = context.WithCancel(context.Background())
+
+	_, err := c.DoRead(context.Background(), "GET", testKey)
+	assert.Equal(t, redis.Nil, err)
+
+	bindingRes, err := bind.Invoke(context.TODO(), &bindings.InvokeRequest{
+		Data:      []byte(testData),
+		Metadata:  map[string]string{"key": testKey},
+		Operation: bindings.CreateOperation,
+	})
+	assert.Equal(t, nil, err)
+	assert.Equal(t, true, bindingRes == nil)
+
+	getRes, err := c.DoRead(context.Background(), "GET", testKey)
+	assert.Equal(t, nil, err)
+	assert.Equal(t, true, getRes == testData)
+}
+
+func TestInvokeGet(t *testing.T) {
 	s, c := setupMiniredis()
 	defer s.Close()
 
@@ -40,22 +68,47 @@ func TestInvoke(t *testing.T) {
 	}
 	bind.ctx, bind.cancel = context.WithCancel(context.Background())
 
-	_, err := c.Do(context.Background(), "GET", testKey).Result()
-	assert.Equal(t, redis.Nil, err)
+	err := c.DoWrite(context.Background(), "SET", testKey, testData)
+	assert.Equal(t, nil, err)
 
 	bindingRes, err := bind.Invoke(context.TODO(), &bindings.InvokeRequest{
-		Data:     []byte(testData),
-		Metadata: map[string]string{"key": testKey},
+		Metadata:  map[string]string{"key": testKey},
+		Operation: bindings.GetOperation,
 	})
 	assert.Equal(t, nil, err)
-	assert.Equal(t, true, bindingRes == nil)
-
-	getRes, err := c.Do(context.Background(), "GET", testKey).Result()
-	assert.Equal(t, nil, err)
-	assert.Equal(t, true, getRes == testData)
+	assert.Equal(t, true, string(bindingRes.Data) == testData)
 }
 
-func setupMiniredis() (*miniredis.Miniredis, *redis.Client) {
+func TestInvokeDelete(t *testing.T) {
+	s, c := setupMiniredis()
+	defer s.Close()
+
+	bind := &Redis{
+		client: c,
+		logger: logger.NewLogger("test"),
+	}
+	bind.ctx, bind.cancel = context.WithCancel(context.Background())
+
+	err := c.DoWrite(context.Background(), "SET", testKey, testData)
+	assert.Equal(t, nil, err)
+
+	getRes, err := c.DoRead(context.Background(), "GET", testKey)
+	assert.Equal(t, nil, err)
+	assert.Equal(t, true, getRes == testData)
+
+	_, err = bind.Invoke(context.TODO(), &bindings.InvokeRequest{
+		Metadata:  map[string]string{"key": testKey},
+		Operation: bindings.DeleteOperation,
+	})
+
+	assert.Equal(t, nil, err)
+
+	rgetRep, err := c.DoRead(context.Background(), "GET", testKey)
+	assert.Equal(t, redis.Nil, err)
+	assert.Equal(t, nil, rgetRep)
+}
+
+func setupMiniredis() (*miniredis.Miniredis, internalredis.RedisClient) {
 	s, err := miniredis.Run()
 	if err != nil {
 		panic(err)
@@ -65,5 +118,5 @@ func setupMiniredis() (*miniredis.Miniredis, *redis.Client) {
 		DB:   0,
 	}
 
-	return s, redis.NewClient(opts)
+	return s, internalredis.ClientFromV8Client(redis.NewClient(opts))
 }

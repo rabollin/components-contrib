@@ -23,6 +23,7 @@ GIT_COMMIT  = $(shell git rev-list -1 HEAD)
 GIT_VERSION = $(shell git describe --always --abbrev=7 --dirty)
 # By default, disable CGO_ENABLED. See the details on https://golang.org/cmd/cgo
 CGO ?= 0
+DAPR_PACKAGE ?= $(dapr_package)
 
 LOCAL_ARCH := $(shell uname -m)
 ifeq ($(LOCAL_ARCH),x86_64)
@@ -65,6 +66,17 @@ ifeq (,$(LINTER_BINARY))
     INSTALLED_LINT_VERSION := "v0.0.0"
 else
 	INSTALLED_LINT_VERSION=v$(shell $(LINTER_BINARY) version | grep -Eo '([0-9]+\.)+[0-9]+' - || "")
+endif
+
+# Build tools
+ifeq ($(TARGET_OS_LOCAL),windows)
+	BUILD_TOOLS_BIN ?= components-contrib-build-tools.exe
+	BUILD_TOOLS ?= ./.build-tools/$(BUILD_TOOLS_BIN)
+	RUN_BUILD_TOOLS ?= cd .build-tools; go.exe run .
+else
+	BUILD_TOOLS_BIN ?= components-contrib-build-tools
+	BUILD_TOOLS ?= ./.build-tools/$(BUILD_TOOLS_BIN)
+	RUN_BUILD_TOOLS ?= cd .build-tools; go run .
 endif
 
 ################################################################################
@@ -118,8 +130,26 @@ modtidy-$(1):
 	cd $(shell dirname $(1)); go mod tidy -compat=1.19; cd -
 endef
 
+define replaceruntime-dapr
+.PHONY: replaceruntime-$(1)
+replaceruntime-$(1):
+	cd $(shell dirname $(1)); go mod edit -replace github.com/dapr/dapr=$(DAPR_PACKAGE); cd -
+endef
+
+define dropreplaceruntime-dapr
+.PHONY: dropreplaceruntime-$(1)
+dropreplaceruntime-$(1):
+	cd $(shell dirname $(1)); go mod edit -dropreplace github.com/dapr/dapr; go get github.com/dapr/dapr@master; go mod tidy; cd -
+endef
+
 # Generate modtidy target action for each go.mod file
 $(foreach MODFILE,$(MODFILES),$(eval $(call modtidy-target,$(MODFILE))))
+
+# Go replace dapr runtime package to tests/.../go.mod.
+$(foreach MODFILE,$(MODFILES),$(eval $(call replaceruntime-dapr,$(MODFILE))))
+
+# Go drop replace dapr runtime package to tests/.../go.mod.
+$(foreach MODFILE,$(MODFILES),$(eval $(call dropreplaceruntime-dapr,$(MODFILE))))
 
 # Enumerate all generated modtidy targets
 # Note that the order of execution matters: root and tests/certification go.mod
@@ -127,9 +157,21 @@ $(foreach MODFILE,$(MODFILES),$(eval $(call modtidy-target,$(MODFILE))))
 # tree walk when finding the go.mod files.
 TIDY_MODFILES:=$(foreach ITEM,$(MODFILES),modtidy-$(ITEM))
 
+REPLACERUNTIME_MODFILES:=$(foreach ITEM,$(MODFILES),replaceruntime-$(ITEM))
+
+DROPREPLACERUNTIME_MODFILES:=$(foreach ITEM,$(MODFILES),dropreplaceruntime-$(ITEM))
+
 # Define modtidy-all action trigger to run make on all generated modtidy targets
 .PHONY: modtidy-all
 modtidy-all: $(TIDY_MODFILES)
+
+# Define replaceruntime-all action trigger to go get replace dapr package specified.
+.PHONY: replaceruntime-all
+replaceruntime-all: $(REPLACERUNTIME_MODFILES)
+
+# Define dropreplaceruntime-all action trigger to go get dapr package master.
+.PHONY: dropreplaceruntime-all
+dropreplaceruntime-all: $(DROPREPLACERUNTIME_MODFILES)
 
 ################################################################################
 # Target: modtidy                                                              #
@@ -139,12 +181,39 @@ modtidy:
 	go mod tidy
 
 ################################################################################
-# Target: check-diff                                                           #
+# Target: check-mod-diff                                                       #
 ################################################################################
-.PHONY: check-diff
-check-diff:
+.PHONY: check-mod-diff
+check-mod-diff:
 	git diff --exit-code -- '*go.mod' # check no changes
 	git diff --exit-code -- '*go.sum' # check no changes
+
+################################################################################
+# Target: compile-build-tools                                                  #
+################################################################################
+.PHONY: compile-build-tools
+compile-build-tools:
+ifeq (,$(wildcard $(BUILD_TOOLS)))
+	cd .build-tools; CGO_ENABLED=$(CGO) GOOS=$(TARGET_OS_LOCAL) GOARCH=$(TARGET_ARCH_LOCAL) go build -o $(BUILD_TOOLS_BIN) .
+endif
+
+################################################################################
+# Components schema targets                                                    #
+################################################################################
+.PHONY: component-metadata-schema
+component-metadata-schema:
+	$(RUN_BUILD_TOOLS) gen-component-schema > ../component-metadata-schema.json
+
+.PHONY: check-component-metadata-schema-diff
+check-component-metadata-schema-diff: component-metadata-schema
+	git diff --exit-code -- component-metadata-schema.json # check no changes
+
+################################################################################
+# Component metadata bundle targets                                            #
+################################################################################
+.PHONY: bundle-component-metadata
+bundle-component-metadata:
+	$(RUN_BUILD_TOOLS) bundle-component-metadata > ../component-metadata-bundle.json
 
 ################################################################################
 # Target: conf-tests                                                           #
@@ -154,8 +223,6 @@ conf-tests:
 	CGO_ENABLED=$(CGO) go test -v -tags=conftests -count=1 ./tests/conformance
 
 ################################################################################
-# Target: e2e-tests-zeebe                                                      #
+# Target: e2e                                                                #
 ################################################################################
-.PHONY: e2e-tests-zeebe
-e2e-tests-zeebe:
-	CGO_ENABLED=$(CGO) go test -v -tags=e2etests -count=1 ./tests/e2e/bindings/zeebe/...
+include tests/e2e/e2e_tests.mk
